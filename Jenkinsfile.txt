@@ -1,0 +1,137 @@
+
+pipeline {
+    agent any
+
+    environment {
+        CLUSTER_NAME = 'nodeapp.k8s.local'
+        KOPS_STATE_STORE = 's3://pragra-kops'  // <-- update this
+        AWS_REGION = 'us-east-1'
+        ZONES = 'us-east-1a,us-east-1b'
+        SSH_PUBLIC_KEY_PATH = '~/.ssh/id_ed25519.pub'
+    }
+
+    stages {
+        stage('Verify AWS Configuration') {
+            steps {
+                sh """
+                echo "✅ Verifying AWS configuration..."
+                aws sts get-caller-identity
+                aws s3 ls ${KOPS_STATE_STORE} || echo "S3 bucket access verified"
+                """
+            }
+        }
+
+        stage('Verify SSH Key Exists') {
+            steps {
+                sh """
+                if [ ! -f ${SSH_PUBLIC_KEY_PATH} ]; then
+                    echo "❌ ERROR: SSH public key not found at ${SSH_PUBLIC_KEY_PATH}"
+                    exit 1
+                else
+                    echo "✅ SSH key found at ${SSH_PUBLIC_KEY_PATH}"
+                fi
+                """
+            }
+        }
+
+        stage('Create Kubernetes Cluster with Kops') {
+            steps {
+                sh """
+                export AWS_DEFAULT_REGION=${AWS_REGION}
+                export KOPS_STATE_STORE=${KOPS_STATE_STORE}
+                export NAME=${CLUSTER_NAME}
+                export KUBECONFIG=/var/lib/jenkins/.kube/config
+
+                echo "🔧 Checking for existing Kubernetes cluster: \${NAME}"
+                if ! kops get cluster --name=\${NAME} --state=\${KOPS_STATE_STORE} > /dev/null 2>&1; then
+                    echo "🚀 Creating Kubernetes cluster: \${NAME}"
+                    kops create cluster --name=\${NAME} \\
+                        --state=\${KOPS_STATE_STORE} \\
+                        --zones=${ZONES} \\
+                        --dns private \\
+                        --node-count=2 \\
+                        --node-size=t3.small \\
+                        --master-size=t3.medium \\
+                        --node-volume-size=12 \\
+                        --master-volume-size=12 \\
+                        --ssh-public-key=${SSH_PUBLIC_KEY_PATH} \\
+                        --yes
+
+                    kops update cluster --name=\${NAME} --state=\${KOPS_STATE_STORE} --yes
+                fi
+
+                echo "📤 Exporting Kubeconfig"
+                kops export kubeconfig --name=\${NAME} --state=\${KOPS_STATE_STORE} --admin
+
+                # Make kubeconfig available to root and Jenkins
+                sudo mkdir -p /root/.kube
+                sudo cp /var/lib/jenkins/.kube/config /root/.kube/config
+
+                echo 'export KUBECONFIG=/var/lib/jenkins/.kube/config' | sudo tee -a /etc/profile
+                echo 'export KUBECONFIG=/var/lib/jenkins/.kube/config' | sudo tee -a /root/.bashrc
+                """
+            }
+        }
+
+        stage('Wait for Cluster to be Ready') {
+            steps {
+                sh """
+                export AWS_DEFAULT_REGION=${AWS_REGION}
+                export KOPS_STATE_STORE=${KOPS_STATE_STORE}
+                export NAME=${CLUSTER_NAME}
+                export KUBECONFIG=\$HOME/.kube/config
+
+                for i in \$(seq 1 15); do
+                    echo "🔍 Attempt \$i/15: Validating cluster..."
+                    if kops validate cluster --name=\${NAME} --state=\${KOPS_STATE_STORE}; then
+                        echo "✅ Cluster validation passed!"
+                        break
+                    else
+                        echo "🕒 Cluster not ready yet. Sleeping 30 seconds..."
+                        sleep 30
+                    fi
+
+                    if [ "\$i" -eq 15 ]; then
+                        echo "❌ Cluster did not become ready in time."
+                        exit 1
+                    fi
+                done
+
+                echo "📶 Checking kubectl access..."
+                for i in \$(seq 1 10); do
+                    if kubectl get nodes > /dev/null 2>&1; then
+                        echo "✅ kubectl can access the cluster."
+                        break
+                    else
+                        sleep 20
+                    fi
+                done
+                """
+            }
+        }
+
+        stage('Final Cluster Validation') {
+            steps {
+                sh """
+                export AWS_DEFAULT_REGION=${AWS_REGION}
+                export KOPS_STATE_STORE=${KOPS_STATE_STORE}
+                export NAME=${CLUSTER_NAME}
+                export KUBECONFIG=\$HOME/.kube/config
+
+                echo "🔧 Final cluster validation: \${NAME}"
+                kops export kubeconfig --name=\${NAME} --state=\${KOPS_STATE_STORE} --admin
+                kops validate cluster --name=\${NAME} --state=\${KOPS_STATE_STORE} --wait 10m
+                """
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "✅ Kubernetes cluster setup completed successfully."
+        }
+        failure {
+            echo "❌ Kubernetes cluster setup failed."
+        }
+    }
+}
